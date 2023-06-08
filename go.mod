@@ -1,4 +1,4 @@
-module github.com/bnema/go-dysproof-api
+module github.com/bnema/go-echo-pocketbase-boilerplate
 
 go 1.20
 
