@@ -66,11 +66,6 @@ type RefreshResponse struct {
 	} `json:"record"`
 }
 
-type OAuthResponse struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-}
-
 type PocketBaseUser struct {
 	Token  string               `json:"token"`
 	Record PocketBaseUserRecord `json:"record"`
