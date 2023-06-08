@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 
@@ -15,21 +16,14 @@ import (
 )
 
 var (
-	sessionStore = sessions.NewCookieStore([]byte("secret")) // Initialize cookie store for session management
-
-	pb               string // Placeholder variable for environment variables
-	pbTradeURL       string
-	pbAuthMethodsURL string
-	pbAuthRefreshURL string
-	OauthRedirectURL = "http://localhost:8080/oauth-redirect" // Redirect URL for OAuth
+	// Configure your app using environment variables
+	sessionStore        = sessions.NewCookieStore([]byte(os.Getenv("SESSION_SECRET")))
+	pb                  = os.Getenv("PB_URL")
+	pbTradeURL          = pb + "/api/collections/users/auth-with-oauth2"
+	pbAuthMethodsURL    = pb + "/api/collections/users/auth-methods"
+	pbAuthRefreshURL    = pb + "/api/collections/users/auth-refresh"
+	OauthRedirectURL, _ = os.LookupEnv("OAUTH_REDIRECT_URL")
 )
-
-func init() {
-	pb = os.Getenv("PB_URL")                                    // Load URL from environment variable
-	pbTradeURL = pb + "/api/collections/users/auth-with-oauth2" // Construct URLs for API endpoints
-	pbAuthMethodsURL = pb + "/api/collections/users/auth-methods"
-	pbAuthRefreshURL = pb + "/api/collections/users/auth-refresh" // POST token to this URL to refresh it
-}
 
 // GetJSON sends a GET request to a given URL and decodes the response JSON into 'v' interface
 func GetJSON(url string, v interface{}) error {
@@ -38,6 +32,10 @@ func GetJSON(url string, v interface{}) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("received non 200 response code")
+	}
 
 	return json.NewDecoder(resp.Body).Decode(v)
 }
@@ -165,15 +163,21 @@ func redirectRoute(c echo.Context) error {
 
 }
 
-// Middleware function to check if user is logged in
 func isLoggedIn(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		session, _ := sessionStore.Get(c.Request(), "session") // Get session for this request
+		session, err := sessionStore.Get(c.Request(), "session")
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": "Session retrieval failed",
+			})
+		}
+
 		if session.Values["token"] == nil {
-			return c.JSON(401, map[string]string{
+			return c.JSON(http.StatusUnauthorized, map[string]string{
 				"error": "Not logged in",
 			})
 		}
+		c.Set("session", session)
 		return next(c)
 	}
 }
@@ -181,17 +185,22 @@ func isLoggedIn(next echo.HandlerFunc) echo.HandlerFunc {
 // Middleware function to verify token
 func verifyToken(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		session, _ := sessionStore.Get(c.Request(), "session") // Get session for this request
+		session := c.Get("session").(*sessions.Session)
 		token := session.Values["token"].(string)
 		refreshResponse, err := refreshAuthToken(token)
 		if err != nil {
-			return c.JSON(401, map[string]string{
+			return c.JSON(http.StatusUnauthorized, map[string]string{
 				"error": "Invalid token",
 			})
 		}
 
 		session.Values["token"] = refreshResponse.Token // Save refreshed token in session
-		session.Save(c.Request(), c.Response())         // Save session data
+		err = session.Save(c.Request(), c.Response())   // Save session data
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": "Failed to save session",
+			})
+		}
 
 		return next(c)
 	}
@@ -211,7 +220,7 @@ func main() {
 	e.Use(session.Middleware(sessionStore)) // Apply session middleware
 
 	e.GET("/", func(c echo.Context) error {
-		return c.String(200, "/") // Define '/' endpoint
+		return c.String(http.StatusOK, "/") // Define '/' endpoint
 	})
 
 	e.GET("/login", loginRoute) // Define '/login' endpoint
