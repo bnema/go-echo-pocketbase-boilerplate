@@ -4,26 +4,67 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 
-	types "github.com/bnema/go-dysproof-api/types" // Importing custom types for this project
-	"github.com/gorilla/sessions"                  // Library for managing sessions
-	"github.com/labstack/echo-contrib/session"     // Echo middleware for session management
-	echo "github.com/labstack/echo/v4"             // HTTP server framework
+	types "github.com/bnema/go-echo-pocketbase-boilerplate/types"
+	"github.com/gorilla/sessions"
+	"github.com/labstack/echo-contrib/session"
+	echo "github.com/labstack/echo/v4"
 
 	_ "github.com/joho/godotenv/autoload" // Package for loading .env files
 )
 
-var (
-	// Configure your app using environment variables
-	sessionStore        = sessions.NewCookieStore([]byte(os.Getenv("SESSION_SECRET")))
-	pb                  = os.Getenv("PB_URL")
-	pbTradeURL          = pb + "/api/collections/users/auth-with-oauth2"
-	pbAuthMethodsURL    = pb + "/api/collections/users/auth-methods"
-	pbAuthRefreshURL    = pb + "/api/collections/users/auth-refresh"
-	OauthRedirectURL, _ = os.LookupEnv("OAUTH_REDIRECT_URL")
-)
+type App struct {
+	SessionStore     sessions.Store
+	PBUrl            string
+	PBTradeURL       string
+	PBAuthMethodsURL string
+	PBAuthRefreshURL string
+	OAuthRedirectURL string
+}
+
+// NewApp creates a new App struct with all the required fields
+func NewApp() *App {
+	baseUrl, err := url.Parse(os.Getenv("PB_URL"))
+	if err != nil {
+		panic(err)
+	}
+
+	app := &App{
+		SessionStore: sessions.NewCookieStore([]byte(os.Getenv("SESSION_SECRET"))),
+		PBUrl:        baseUrl.String(),
+	}
+
+	authMethodsUrl, err := baseUrl.Parse("/api/collections/users/auth-methods")
+	if err != nil {
+		panic(err)
+	}
+	app.PBAuthMethodsURL = authMethodsUrl.String()
+
+	authRefreshUrl, err := baseUrl.Parse("/api/collections/users/auth-refresh")
+	if err != nil {
+		panic(err)
+	}
+	app.PBAuthRefreshURL = authRefreshUrl.String()
+
+	tradeUrl, err := baseUrl.Parse("/api/collections/users/auth-with-oauth2")
+	if err != nil {
+		panic(err)
+	}
+	app.PBTradeURL = tradeUrl.String()
+
+	oauthRedirectURL, ok := os.LookupEnv("OAUTH_REDIRECT_URL")
+	if !ok {
+		panic("OAUTH_REDIRECT_URL environment variable is not set")
+	}
+	app.OAuthRedirectURL = oauthRedirectURL
+
+	return app
+}
 
 // GetJSON sends a GET request to a given URL and decodes the response JSON into 'v' interface
 func GetJSON(url string, v interface{}) error {
@@ -37,19 +78,29 @@ func GetJSON(url string, v interface{}) error {
 		return errors.New("received non 200 response code")
 	}
 
-	return json.NewDecoder(resp.Body).Decode(v)
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(bodyBytes, v)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // PostJSON sends a POST request to a given URL with a JSON body, and decodes the response JSON into 'v' interface
 func PostJSON(url string, body interface{}, v interface{}) error {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
 
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to post JSON: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -57,9 +108,9 @@ func PostJSON(url string, body interface{}, v interface{}) error {
 }
 
 // getAuthMethods retrieves available authentication methods for a given provider
-func getAuthMethods(provider string) (types.AuthMethodsResponse, error) {
+func (app *App) getAuthMethods(provider string) (types.AuthMethodsResponse, error) {
 	authMethods := types.AuthMethodsResponse{}
-	err := GetJSON(pbAuthMethodsURL, &authMethods)
+	err := GetJSON(app.PBAuthMethodsURL, &authMethods)
 	if err != nil {
 		return types.AuthMethodsResponse{}, err
 	}
@@ -75,9 +126,10 @@ func getAuthMethods(provider string) (types.AuthMethodsResponse, error) {
 
 }
 
-func refreshAuthToken(token string) (types.RefreshResponse, error) {
+// refreshAuthToken refreshes an existing token
+func (app *App) refreshAuthToken(token string) (types.RefreshResponse, error) {
 	refreshResponse := types.RefreshResponse{}
-	err := PostJSON(pbAuthRefreshURL, token, &refreshResponse)
+	err := PostJSON(app.PBAuthRefreshURL, token, &refreshResponse)
 	if err != nil {
 		return types.RefreshResponse{}, err
 	}
@@ -86,9 +138,9 @@ func refreshAuthToken(token string) (types.RefreshResponse, error) {
 }
 
 // tradeCodeForToken exchanges an authorization code for a token
-func tradeCodeForToken(oAuthRequest types.OAuthRequest) (types.TradeResponse, error) {
+func (app *App) tradeCodeForToken(oAuthRequest types.OAuthRequest) (types.TradeResponse, error) {
 	tradeResponse := types.TradeResponse{}
-	err := PostJSON(pbTradeURL, oAuthRequest, &tradeResponse)
+	err := PostJSON(app.PBTradeURL, oAuthRequest, &tradeResponse)
 	if err != nil {
 		return types.TradeResponse{}, err
 	}
@@ -97,18 +149,23 @@ func tradeCodeForToken(oAuthRequest types.OAuthRequest) (types.TradeResponse, er
 }
 
 // loginRoute handles the '/login' endpoint and initiates OAuth authentication
-func loginRoute(c echo.Context) error {
+func (app *App) loginRoute(c echo.Context) error {
 	provider := c.QueryParam("provider")
-	authMethods, err := getAuthMethods(provider)
+	authMethods, err := app.getAuthMethods(provider)
 	if err != nil {
-		return c.JSON(400, map[string]string{
-			"error": "Failed to get auth methods",
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("Failed to get auth methods: %v", err),
 		})
 	}
 
-	session, _ := sessionStore.Get(c.Request(), "session") // Get session for this request
-	session.Options.MaxAge = 60 * 15                       // Set session max age to 15 minutes
-	session.Options.HttpOnly = true                        // Set session cookie to HTTP only
+	session, err := app.SessionStore.Get(c.Request(), "session") // Get session for this request
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error": fmt.Sprintf("Failed to get session: %v", err),
+		})
+	}
+	session.Options.MaxAge = 60 * 15 // Set session max age to 15 minutes
+	session.Options.HttpOnly = true  // Set session cookie to HTTP only
 	session.Values["provider"] = provider
 	session.Values["state"] = authMethods.AuthProviders[0].State
 	session.Values["codeVerifier"] = authMethods.AuthProviders[0].CodeVerifier
@@ -119,8 +176,8 @@ func loginRoute(c echo.Context) error {
 }
 
 // redirectRoute handles the '/oauth-redirect' endpoint and finalizes the OAuth authentication process
-func redirectRoute(c echo.Context) error {
-	session, _ := sessionStore.Get(c.Request(), "session") // Get session for this request
+func (app *App) redirectRoute(c echo.Context) error {
+	session, _ := app.SessionStore.Get(c.Request(), "session") // Get session for this request
 	provider := session.Values["provider"].(string)
 	state := session.Values["state"].(string)
 	codeVerifier := session.Values["codeVerifier"].(string)
@@ -136,11 +193,11 @@ func redirectRoute(c echo.Context) error {
 		Provider:     provider,
 		Code:         code,
 		CodeVerifier: codeVerifier,
-		RedirectURL:  OauthRedirectURL,
+		RedirectURL:  app.OAuthRedirectURL,
 		State:        state,
 	}
 
-	tradeResponse, err := tradeCodeForToken(oAuthRequest)
+	tradeResponse, err := app.tradeCodeForToken(oAuthRequest)
 	if err != nil {
 		return c.JSON(400, map[string]string{
 			"error": "Failed to trade code for token",
@@ -163,9 +220,10 @@ func redirectRoute(c echo.Context) error {
 
 }
 
-func isLoggedIn(next echo.HandlerFunc) echo.HandlerFunc {
+// isLoggedIn is a middleware that checks if a user is logged in
+func (app *App) isLoggedIn(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		session, err := sessionStore.Get(c.Request(), "session")
+		session, err := app.SessionStore.Get(c.Request(), "session")
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{
 				"error": "Session retrieval failed",
@@ -182,12 +240,12 @@ func isLoggedIn(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
-// Middleware function to verify token
-func verifyToken(next echo.HandlerFunc) echo.HandlerFunc {
+// verifyToken is a middleware that verifies the validity of a token
+func (app *App) verifyToken(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		session := c.Get("session").(*sessions.Session)
 		token := session.Values["token"].(string)
-		refreshResponse, err := refreshAuthToken(token)
+		refreshResponse, err := app.refreshAuthToken(token)
 		if err != nil {
 			return c.JSON(http.StatusUnauthorized, map[string]string{
 				"error": "Invalid token",
@@ -206,6 +264,7 @@ func verifyToken(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+// TestPrivateRoute is a test endpoint that requires authentication
 func TestPrivateRoute(c echo.Context) error {
 	// return a json response "you are logged in"
 	return c.JSON(200, map[string]string{
@@ -216,18 +275,25 @@ func TestPrivateRoute(c echo.Context) error {
 
 // Initializes the server and defines endpoints
 func main() {
+	app := NewApp()
+
 	e := echo.New()
-	e.Use(session.Middleware(sessionStore)) // Apply session middleware
+	e.Use(session.Middleware(app.SessionStore)) // Use session middleware
 
 	e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "/") // Define '/' endpoint
 	})
 
-	e.GET("/login", loginRoute) // Define '/login' endpoint
+	e.GET("/login", app.loginRoute) // Define '/login' endpoint
 
-	e.GET("/oauth-redirect", redirectRoute) // Define '/oauth-redirect' endpoint
+	e.GET("/oauth-redirect", app.redirectRoute) // Define '/oauth-redirect' endpoint
 
-	e.GET("/private", TestPrivateRoute, isLoggedIn, verifyToken) // Define '/private' endpoint
+	e.GET("/private", TestPrivateRoute, app.isLoggedIn, app.verifyToken) // Define '/private' endpoint
+
+	e.GET("/debug", func(c echo.Context) error {
+		provider := c.QueryParam("provider")
+		return c.String(http.StatusOK, provider)
+	})
 
 	e.Logger.Fatal(e.Start(":8080")) // Start server on port 8080
 }
